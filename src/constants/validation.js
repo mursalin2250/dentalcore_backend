@@ -1,0 +1,15 @@
+export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const OBJECT_ID_PATTERN = /^[a-f\d]{24}$/i;
+export const NAME_MAX_LENGTH = 80;
+export const SEARCH_MAX_LENGTH = 100;
+export const ADDRESS_FIELD_MAX = 120;
+export const POSTAL_CODE_MAX = 20;
+export const EDUCATION_INSTITUTION_MAX = 120;
+export const EDUCATION_DEGREE_MAX = 80;
+export const EDUCATION_FIELD_MAX = 80;
+export const CERT_TITLE_MAX = 120;
+export const CERT_BODY_MAX = 120;
+export const YEAR_MIN = 1950;
+export const YEAR_MAX = 2100;
+export const MAX_EDUCATION_ITEMS = 20;
+export const MAX_CERTIFICATION_ITEMS = 20;

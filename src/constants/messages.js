@@ -1,0 +1,88 @@
+import { PASSWORD_RULES } from "./auth.js";
+import { LIST_LIMIT } from "./dashboard.js";
+import { NAME_MAX_LENGTH, SEARCH_MAX_LENGTH } from "./validation.js";
+
+export const MESSAGES = Object.freeze({
+  GENERIC: {
+    ROUTE_NOT_FOUND: "Route not found.",
+    SERVER_ERROR: "Something went wrong. Please try again later.",
+    INVALID_JSON: "Request body is not valid JSON.",
+    BODY_TOO_LARGE: "Request body is too large.",
+    TOO_MANY_REQUESTS: "Too many attempts. Please try again later.",
+    VALIDATION_FAILED: "Please correct the highlighted fields.",
+    INVALID_ID: "Invalid identifier.",
+    DUPLICATE_VALUE: "A record with this value already exists.",
+  },
+  HEALTH: {
+    DB_DOWN: "Database is not connected.",
+  },
+  AUTH: {
+    REGISTERED: "Account created.",
+    LOGGED_IN: "Signed in.",
+    LOGGED_OUT: "Signed out.",
+    INVALID_CREDENTIALS: "Incorrect email or password.",
+    ACCOUNT_INACTIVE: "Your account is inactive. Contact an administrator.",
+    REGISTRATION_CLOSED: "Sign up is closed. Ask an administrator to add you to the team.",
+    NOT_AUTHENTICATED: "Please sign in to continue.",
+    FORBIDDEN: "You do not have permission to do this.",
+  },
+  TEAM: {
+    CREATED: "Team member added.",
+    UPDATED: "Team member updated.",
+    REMOVED: "Team member removed.",
+    NOT_FOUND: "Team member not found.",
+    EMAIL_TAKEN: "A team member with this email already exists.",
+    CANNOT_REMOVE_SELF: "You cannot remove your own account.",
+    CANNOT_DEACTIVATE_SELF: "You cannot deactivate your own account.",
+    LAST_ADMIN: "There must be at least one active admin.",
+  },
+  VALIDATION: {
+    NAME_REQUIRED: "Enter a name.",
+    NAME_TOO_LONG: `Use ${NAME_MAX_LENGTH} characters or fewer.`,
+    EMAIL_REQUIRED: "Enter an email address.",
+    EMAIL_INVALID: "Enter a valid email address.",
+    PASSWORD_REQUIRED: "Enter a password.",
+    PASSWORD_TOO_SHORT: `Use at least ${PASSWORD_RULES.MIN_LENGTH} characters.`,
+    PASSWORD_TOO_LONG: `Use ${PASSWORD_RULES.MAX_LENGTH} characters or fewer.`,
+    ROLE_INVALID: "Choose a valid role.",
+    STATUS_INVALID: "Choose a valid status.",
+    ID_INVALID: "Invalid identifier.",
+    SEARCH_TOO_LONG: `Search must be ${SEARCH_MAX_LENGTH} characters or fewer.`,
+    NO_CHANGES: "Send at least one field to update.",
+    RANGE_INVALID: "Choose a valid date range.",
+    LIMIT_INVALID: `Use a number between 1 and ${LIST_LIMIT.MAX}.`,
+  },
+  DOCTOR: {
+    NOT_FOUND: "Doctor not found.",
+    CREATED: "Doctor added.",
+    UPDATED: "Doctor updated.",
+    DELETED: "Doctor removed.",
+  },
+  PATIENT: {
+    CREATED: "Patient added.",
+    UPDATED: "Patient updated.",
+    REMOVED: "Patient removed.",
+    REMOVED_MANY: (count) => `${count} patient${count === 1 ? "" : "s"} removed.`,
+    NOT_FOUND: "Patient not found.",
+    CODE_TAKEN: "A patient with this ID already exists.",
+    PRESCRIPTION_ADDED: "Prescription added.",
+    MEDICINE_REQUIRED: "Enter at least one medicine.",
+  },
+    ENV: {
+    INVALID: "Invalid environment variables:",
+    SECRET_TOO_SHORT: "must be at least 32 characters",
+    EXPIRES_IN_INVALID: 'must look like "30m", "12h" or "7d"',
+  },
+  SERVER: {
+    DB_CONNECTED: "MongoDB connected.",
+    STARTUP_FAILED: "Failed to start the server:",
+    LISTENING: (port) => `API listening on port ${port}.`,
+    SHUTTING_DOWN: (reason) => `${reason} received. Shutting down.`,
+  },
+  SEED: {
+    CREATED: (email) => `Admin created: ${email}`,
+    EXISTS: (email) => `A user with ${email} already exists. Nothing to do.`,
+    INVALID_ENV: "Invalid seed settings:",
+    DEMO_DONE: (counts) => `Demo data ready: ${counts}.`,
+  },
+});
