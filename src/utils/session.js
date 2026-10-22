@@ -5,7 +5,7 @@ import { signToken } from "./token.js";
 const cookieOptions = () => ({
   httpOnly: true,
   secure: env.isProduction,
-  sameSite: COOKIE_SAME_SITE,
+  sameSite: env.isProduction ? "none" : "lax",
   path: "/",
 });
 
