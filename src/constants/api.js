@@ -18,7 +18,12 @@ export const ROUTE_PATHS = Object.freeze({
   ACTIVITY: "/activity",
   DOCTORS: "/doctors",
   PATIENTS: "/patients",
+  APPOINTMENTS: "/appointments",
+  MEDICATIONS: "/medications",
+  STOCK_MOVEMENTS: "/stock-movements",
   STATS: "/stats",
+  CALENDAR: "/calendar",
+  NOTES: "/notes",
   BULK: "/bulk",
 });
 

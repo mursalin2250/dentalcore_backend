@@ -24,7 +24,7 @@ import { addDays, addMonths, bucketKey, startOfDay, startOfMonth } from "../util
 import { percentChange } from "../utils/percentChange.js";
 import { sendSuccess } from "../utils/response.js";
 
-const LOW_STOCK_FILTER = { $expr: { $lte: ["$quantity", "$reorderLevel"] } };
+const LOW_STOCK_FILTER = { isArchived: { $ne: true }, $expr: { $lte: ["$stock", "$reorderLevel"] } };
 
 const canSee = (card, user) => CARD_ROLES[card].includes(user.role);
 const idOf = (doc) => doc._id.toString();
@@ -148,16 +148,16 @@ export const listLowStock = asyncHandler(async (req, res) => {
   const { limit } = req.validated.query;
 
   const medications = await Medication.find(LOW_STOCK_FILTER)
-    .sort({ quantity: 1, name: 1 })
+    .sort({ stock: 1, name: 1 })
     .limit(limit)
-    .select("name unit quantity reorderLevel")
+    .select("name unit stock reorderLevel")
     .lean();
 
   const items = medications.map((m) => ({
     id: idOf(m),
     name: m.name,
     unit: m.unit,
-    quantity: m.quantity,
+    quantity: m.stock,
     reorderLevel: m.reorderLevel,
   }));
   sendSuccess(res, { data: { items } });
@@ -206,7 +206,7 @@ const ACTIVITY_SOURCES = {
       at: m.createdAt,
       subject: m.medication?.name ?? null,
       movementType: m.type,
-      quantity: m.quantity,
+      quantity: m.stock,
     }));
   },
 };

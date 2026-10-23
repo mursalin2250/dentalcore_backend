@@ -13,3 +13,9 @@ export const YEAR_MIN = 1950;
 export const YEAR_MAX = 2100;
 export const MAX_EDUCATION_ITEMS = 20;
 export const MAX_CERTIFICATION_ITEMS = 20;
+
+export const DEFAULT_DURATION_MINUTES = 30;
+export const MIN_DURATION_MINUTES = 5;
+export const MAX_DURATION_MINUTES = 480;
+export const REASON_MAX_LENGTH = 500;
+export const NOTE_MAX_LENGTH = 2000;

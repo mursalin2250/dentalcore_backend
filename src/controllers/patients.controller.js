@@ -95,7 +95,7 @@ export const getPatientStats = asyncHandler(async (_req, res) => {
     Patient.countDocuments({ status: PATIENT_STATUSES.IN_TREATMENT }),
     Appointment.countDocuments({
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
+      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
     }),
   ]);
 

@@ -43,27 +43,17 @@ export const getDoctorStats = asyncHandler(async (_req, res) => {
   const todayStart = startOfToday();
   const todayEnd = endOfToday();
 
-  const [total, specialtyAgg, patientsAssigned, appointmentsToday] = await Promise.all([
+  const [total, patientsAssigned, appointmentsToday] = await Promise.all([
     Doctor.countDocuments(),
-    Doctor.aggregate([
-      { $match: { specialty: { $nin: ["", null] } } },
-      { $group: { _id: "$specialty" } },
-      { $count: "count" },
-    ]),
     Patient.countDocuments({ doctor: { $ne: null } }),
     Appointment.countDocuments({
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
+      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
     }),
   ]);
-
+  const active = total;
   sendSuccess(res, {
-    data: {
-      total,
-      specialties: specialtyAgg[0]?.count || 0,
-      patientsAssigned,
-      appointmentsToday,
-    },
+    data: { total, active, patientsAssigned, appointmentsToday },
   });
 });
 
@@ -85,7 +75,7 @@ export const listDoctors = asyncHandler(async (req, res) => {
 
   const [doctors, total, specialtyValues] = await Promise.all([
     Doctor.find(filter)
-      .sort({ name: 1, _id: 1 })
+      .sort({ updatedAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit),
     Doctor.countDocuments(filter),
@@ -120,7 +110,7 @@ export const getDoctor = asyncHandler(async (req, res) => {
     Appointment.countDocuments({
       doctor: doctorId,
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
+      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
     }),
     Appointment.distinct("patient", {
       doctor: doctorId,
@@ -154,7 +144,7 @@ export const listDoctorPatients = asyncHandler(async (req, res) => {
   const [patients, total] = await Promise.all([
     Patient.find(filter)
       .select("name problem treatment status avatarUrl")
-      .sort({ name: 1, _id: 1 })
+      .sort({ updatedAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
       .lean(),
