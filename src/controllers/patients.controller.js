@@ -193,7 +193,7 @@ export const getPatient = asyncHandler(async (req, res) => {
       .lean(),
     Invoice.find({ patient: patient._id })
       .sort({ createdAt: -1 })
-      .select("number totalAmount status paidAt createdAt")
+      .select("invoiceNumber number totalCost totalAmount amountPaid status paidAt createdAt")
       .lean(),
     Appointment.exists({ patient: patient._id }),
   ]);
@@ -206,10 +206,8 @@ export const getPatient = asyncHandler(async (req, res) => {
 
   const visit = visitAgg[0];
 
-  // Paid invoices reduce the outstanding balance alongside the stored amountPaid.
-  const paidFromInvoices = payments
-    .filter((inv) => inv.status === "paid")
-    .reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
+  // Payments received on the patient's invoice reduce outstanding balance.
+  const paidFromInvoices = payments.reduce((sum, inv) => sum + (Number(inv.amountPaid) || 0), 0);
   const amountPaid = Math.max(Number(patient.amountPaid) || 0, paidFromInvoices);
 
   sendSuccess(res, {
@@ -233,8 +231,11 @@ export const getPatient = asyncHandler(async (req, res) => {
       })),
       payments: payments.map((inv) => ({
         id: inv._id.toString(),
-        number: inv.number,
-        totalAmount: inv.totalAmount,
+        number: inv.invoiceNumber || inv.number,
+        invoiceNumber: inv.invoiceNumber || inv.number,
+        totalAmount: inv.totalCost ?? inv.totalAmount,
+        totalCost: inv.totalCost ?? inv.totalAmount,
+        amountPaid: inv.amountPaid ?? 0,
         status: inv.status,
         paidAt: inv.paidAt,
         createdAt: inv.createdAt,

@@ -30,6 +30,7 @@ export const FINAL_APPOINTMENT_STATUSES = Object.freeze([
 export const INVOICE_STATUSES = Object.freeze({
   PENDING: "pending",
   PAID: "paid",
+  OVERDUE: "overdue",
   CANCELLED: "cancelled",
 });
 export const INVOICE_STATUS_VALUES = Object.freeze(Object.values(INVOICE_STATUSES));

@@ -21,6 +21,7 @@ export const ROUTE_PATHS = Object.freeze({
   APPOINTMENTS: "/appointments",
   MEDICATIONS: "/medications",
   STOCK_MOVEMENTS: "/stock-movements",
+  INVOICES: "/invoices",
   STATS: "/stats",
   CALENDAR: "/calendar",
   NOTES: "/notes",

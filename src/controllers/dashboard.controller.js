@@ -37,10 +37,17 @@ async function getAppointmentScope(user) {
   return { doctor: doctor?._id ?? null };
 }
 
+/** Revenue = sum of non-voided payments received in the period. */
 async function sumPaidInvoices(from, to) {
   const [row] = await Invoice.aggregate([
-    { $match: { status: INVOICE_STATUSES.PAID, paidAt: { $gte: from, $lt: to } } },
-    { $group: { _id: null, total: { $sum: "$totalAmount" } } },
+    { $unwind: "$payments" },
+    {
+      $match: {
+        "payments.isVoided": { $ne: true },
+        "payments.paidAt": { $gte: from, $lt: to },
+      },
+    },
+    { $group: { _id: null, total: { $sum: "$payments.amount" } } },
   ]);
   return row?.total ?? 0;
 }
@@ -98,11 +105,23 @@ export const getRevenue = asyncHandler(async (req, res) => {
     : addMonths(startOfMonth(), -(count - 1));
 
   const rows = await Invoice.aggregate([
-    { $match: { status: INVOICE_STATUSES.PAID, paidAt: { $gte: first } } },
+    { $unwind: "$payments" },
+    {
+      $match: {
+        "payments.isVoided": { $ne: true },
+        "payments.paidAt": { $gte: first },
+      },
+    },
     {
       $group: {
-        _id: { $dateToString: { format: isDaily ? "%Y-%m-%d" : "%Y-%m", date: "$paidAt", timezone: TIMEZONE } },
-        amount: { $sum: "$totalAmount" },
+        _id: {
+          $dateToString: {
+            format: isDaily ? "%Y-%m-%d" : "%Y-%m",
+            date: "$payments.paidAt",
+            timezone: TIMEZONE,
+          },
+        },
+        amount: { $sum: "$payments.amount" },
       },
     },
   ]);
@@ -186,13 +205,18 @@ const ACTIVITY_SOURCES = {
     }));
   },
   [ACTIVITY_TYPES.INVOICE_PAID]: async (limit) => {
-    const rows = await Invoice.find({ status: INVOICE_STATUSES.PAID })
+    const rows = await Invoice.find({ amountPaid: { $gt: 0 }, isCancelled: { $ne: true } })
       .sort({ paidAt: -1 })
       .limit(limit)
-      .select("patient totalAmount paidAt")
+      .select("patient amountPaid totalCost paidAt")
       .populate("patient", "name")
       .lean();
-    return rows.map((i) => ({ id: idOf(i), at: i.paidAt, subject: i.patient?.name ?? null, amount: i.totalAmount }));
+    return rows.map((i) => ({
+      id: idOf(i),
+      at: i.paidAt,
+      subject: i.patient?.name ?? null,
+      amount: i.amountPaid,
+    }));
   },
   [ACTIVITY_TYPES.STOCK_MOVED]: async (limit) => {
     const rows = await StockMovement.find()

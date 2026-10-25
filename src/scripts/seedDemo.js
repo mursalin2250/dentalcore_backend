@@ -160,22 +160,60 @@ function buildAppointments({ now, today, patients, doctors }) {
 
 function buildInvoices(appointments) {
   const prices = new Map(TREATMENTS);
-  return appointments
-    .filter((a) => a.status === APPOINTMENT_STATUSES.COMPLETED)
-    .map((a, index) => {
-      const paidAt = new Date(a.startsAt.getTime() + VISIT_MINUTES * MINUTE_MS);
-      const isPaid = random() < 0.95;
-      return {
-        // DEMO- prefix keeps these away from real invoice numbers.
-        number: `DEMO-INV-${String(index + 1).padStart(6, "0")}`,
+  // One invoice per patient: aggregate completed treatments.
+  const byPatient = new Map();
+  for (const a of appointments) {
+    if (a.status !== APPOINTMENT_STATUSES.COMPLETED) continue;
+    const key = String(a.patient);
+    const price = (prices.get(a.treatment) || 500) * CURRENCY_MINOR_UNIT;
+    const paidAt = new Date(a.startsAt.getTime() + VISIT_MINUTES * MINUTE_MS);
+    if (!byPatient.has(key)) {
+      byPatient.set(key, {
         patient: a.patient,
-        totalAmount: prices.get(a.treatment) * CURRENCY_MINOR_UNIT,
-        status: isPaid ? INVOICE_STATUSES.PAID : INVOICE_STATUSES.PENDING,
-        paidAt: isPaid ? paidAt : null,
-        isDemo: true,
-        ...stamp(paidAt),
-      };
-    });
+        doctor: a.doctor,
+        totalCost: 0,
+        treatments: [],
+        payments: [],
+        lastAt: paidAt,
+      });
+    }
+    const row = byPatient.get(key);
+    row.totalCost += price;
+    row.treatments.push(a.treatment);
+    if (random() < 0.85) {
+      row.payments.push({
+        amount: price,
+        method: "cash",
+        paidAt,
+        note: a.treatment || "",
+        isVoided: false,
+      });
+    }
+    if (paidAt > row.lastAt) row.lastAt = paidAt;
+  }
+  let index = 0;
+  return [...byPatient.values()].map((row) => {
+    index += 1;
+    const amountPaid = row.payments.reduce((s, p) => s + p.amount, 0);
+    const invoiceNumber = `DEMO-INV-${String(index).padStart(6, "0")}`;
+    return {
+      invoiceNumber,
+      number: invoiceNumber,
+      patient: row.patient,
+      doctor: row.doctor,
+      problem: "",
+      treatment: row.treatments.slice(-3).join(", "),
+      totalCost: row.totalCost,
+      totalAmount: row.totalCost,
+      amountPaid,
+      payments: row.payments,
+      isCancelled: false,
+      status: amountPaid >= row.totalCost ? INVOICE_STATUSES.PAID : INVOICE_STATUSES.PENDING,
+      paidAt: row.payments.length ? row.lastAt : null,
+      isDemo: true,
+      ...stamp(row.lastAt),
+    };
+  });
 }
 
 function buildStockMovements({ now, medications }) {
