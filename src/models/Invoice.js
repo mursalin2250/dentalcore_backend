@@ -6,6 +6,15 @@ import {
 } from "../constants/billing.js";
 import { demoFlag } from "./demoFlag.js";
 
+const lineItemSchema = new mongoose.Schema(
+  {
+    description: { type: String, trim: true, default: "" },
+    quantity: { type: Number, required: true, min: 0, default: 1, validate: Number.isInteger },
+    rate: { type: Number, required: true, min: 0, default: 0, validate: Number.isInteger },
+  },
+  { _id: true },
+);
+
 const paymentSchema = new mongoose.Schema(
   {
     amount: { type: Number, required: true, min: 1, validate: Number.isInteger },
@@ -24,19 +33,24 @@ const paymentSchema = new mongoose.Schema(
 const invoiceSchema = new mongoose.Schema(
   {
     invoiceNumber: { type: String, required: true, unique: true, trim: true },
-    // Legacy alias kept in sync for older queries that still read `number`.
     number: { type: String, trim: true },
-    patient: { type: mongoose.Schema.Types.ObjectId, ref: "Patient", required: true },
+    patient: { type: mongoose.Schema.Types.ObjectId, ref: "Patient", default: null },
+    patientName: { type: String, trim: true, default: "" },
+    patientPhone: { type: String, trim: true, default: "" },
+    patientAddress: { type: String, trim: true, default: "" },
     doctor: { type: mongoose.Schema.Types.ObjectId, ref: "Doctor", default: null },
     problem: { type: String, trim: true, default: "" },
     treatment: { type: String, trim: true, default: "" },
+    lineItems: { type: [lineItemSchema], default: [] },
+    discountMinor: { type: Number, min: 0, default: 0, validate: Number.isInteger },
+    terms: { type: String, trim: true, default: "" },
+    logoDataUrl: { type: String, default: "" },
     totalCost: { type: Number, required: true, min: 0, default: 0, validate: Number.isInteger },
     amountPaid: { type: Number, required: true, min: 0, default: 0, validate: Number.isInteger },
     payments: { type: [paymentSchema], default: [] },
     dueDate: { type: Date, default: null },
     notes: { type: String, trim: true, default: "" },
     isCancelled: { type: Boolean, default: false },
-    // Legacy fields kept for gradual migration / seed compatibility.
     totalAmount: { type: Number, min: 0, validate: Number.isInteger },
     status: { type: String, default: INVOICE_STATUSES.PENDING },
     paidAt: { type: Date, default: null },
@@ -55,96 +69,97 @@ const invoiceSchema = new mongoose.Schema(
   },
 );
 
-invoiceSchema.index({ patient: 1 }, { unique: true });
+invoiceSchema.index({ patient: 1 }, { unique: true, sparse: true });
 invoiceSchema.index({ isCancelled: 1, updatedAt: -1 });
 invoiceSchema.index({ "payments.paidAt": -1 });
 invoiceSchema.index({ createdAt: -1 });
 
-/** Recompute amountPaid from non-voided payments and sync legacy fields. */
 export function recomputePaid(invoice) {
-  const valid = (invoice.payments || []).filter((p) => !p.isVoided);
-  const amountPaid = valid.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-  invoice.amountPaid = amountPaid;
-  const totalCost = Number(invoice.totalCost ?? invoice.totalAmount ?? 0);
-  invoice.totalCost = totalCost;
-  invoice.totalAmount = totalCost;
-  invoice.number = invoice.invoiceNumber || invoice.number;
-  const lastPay = valid.map((p) => new Date(p.paidAt).getTime()).filter((t) => !Number.isNaN(t));
-  invoice.paidAt = lastPay.length ? new Date(Math.max(...lastPay)) : null;
-  return amountPaid;
+  const paid = (invoice.payments || [])
+    .filter((p) => !p.isVoided)
+    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  invoice.amountPaid = paid;
+  return paid;
 }
 
-export function deriveInvoiceStatus(invoice, now = new Date()) {
+export function deriveInvoiceStatus(invoice) {
   if (invoice.isCancelled) return INVOICE_STATUSES.CANCELLED;
-  const totalCost = Number(invoice.totalCost ?? invoice.totalAmount ?? 0);
-  const amountPaid = Number(invoice.amountPaid ?? 0);
-  const amountDue = Math.max(0, totalCost - amountPaid);
-  if (amountDue <= 0 && totalCost >= 0) return INVOICE_STATUSES.PAID;
-
-  const valid = (invoice.payments || []).filter((p) => !p.isVoided && p.paidAt);
-  let anchor = invoice.createdAt ? new Date(invoice.createdAt) : now;
-  if (valid.length) {
-    const times = valid.map((p) => new Date(p.paidAt).getTime());
-    anchor = new Date(Math.max(...times));
-  }
-  const overdueMs = INVOICE_OVERDUE_DAYS * 24 * 60 * 60 * 1000;
-  if (now.getTime() - anchor.getTime() > overdueMs) return INVOICE_STATUSES.OVERDUE;
+  const due = Math.max(0, Number(invoice.totalCost) - Number(invoice.amountPaid));
+  if (due <= 0) return INVOICE_STATUSES.PAID;
+  const lastPayment = (invoice.payments || [])
+    .filter((p) => !p.isVoided)
+    .map((p) => new Date(p.paidAt).getTime())
+    .filter((t) => !Number.isNaN(t))
+    .sort((a, b) => b - a)[0];
+  const anchor = lastPayment || new Date(invoice.createdAt).getTime();
+  const days = (Date.now() - anchor) / (24 * 60 * 60 * 1000);
+  if (days > INVOICE_OVERDUE_DAYS) return INVOICE_STATUSES.OVERDUE;
   return INVOICE_STATUSES.PENDING;
 }
 
-function shapePerson(ref) {
-  if (!ref) return null;
-  if (typeof ref !== "object") return { id: ref.toString() };
+function shapePerson(person) {
+  if (!person) return null;
+  if (typeof person !== "object") return { id: String(person) };
+  const id = person.id || person._id;
+  if (!id) return null;
   return {
-    id: (ref.id || ref._id)?.toString?.(),
-    name: ref.name,
-  };
-}
-
-function shapePayment(p) {
-  return {
-    id: (p.id || p._id)?.toString?.(),
-    amount: p.amount,
-    method: p.method,
-    paidAt: p.paidAt,
-    note: p.note || "",
-    recordedBy: shapePerson(p.recordedBy),
-    isVoided: Boolean(p.isVoided),
-    voidReason: p.voidReason || "",
-    voidedBy: shapePerson(p.voidedBy),
-    voidedAt: p.voidedAt || null,
+    id: id.toString(),
+    name: person.name || "",
+    phone: person.phone || "",
+    address: person.address || "",
   };
 }
 
 export function shapeInvoice(doc) {
-  if (!doc) return null;
   const json = typeof doc.toJSON === "function" ? doc.toJSON() : { ...doc };
-  const totalCost = Number(json.totalCost ?? json.totalAmount ?? 0);
-  const amountPaid = Number(json.amountPaid ?? 0);
+  recomputePaid({ payments: json.payments, amountPaid: json.amountPaid });
+  const amountPaid = (json.payments || [])
+    .filter((p) => !p.isVoided)
+    .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const totalCost = Number(json.totalCost) || 0;
   const amountDue = Math.max(0, totalCost - amountPaid);
   const status = deriveInvoiceStatus({
     ...json,
-    totalCost,
     amountPaid,
+    totalCost,
   });
   return {
-    id: (json.id || json._id)?.toString?.(),
+    id: json.id,
     invoiceNumber: json.invoiceNumber || json.number,
     number: json.invoiceNumber || json.number,
     patient: shapePerson(json.patient),
+    patientName: json.patientName || json.patient?.name || "",
+    patientPhone: json.patientPhone || json.patient?.phone || "",
+    patientAddress: json.patientAddress || json.patient?.address || "",
     doctor: shapePerson(json.doctor),
     problem: json.problem || "",
     treatment: json.treatment || "",
+    lineItems: (json.lineItems || []).map((li) => ({
+      id: (li.id || li._id)?.toString?.(),
+      description: li.description || "",
+      quantity: Number(li.quantity) || 0,
+      rate: Number(li.rate) || 0,
+    })),
+    discountMinor: Number(json.discountMinor) || 0,
+    terms: json.terms || "",
+    logoDataUrl: json.logoDataUrl || "",
     totalCost,
-    totalAmount: totalCost,
     amountPaid,
     amountDue,
     status,
-    payments: (json.payments || []).map(shapePayment).sort((a, b) => new Date(b.paidAt) - new Date(a.paidAt)),
+    payments: (json.payments || []).map((p) => ({
+      id: (p.id || p._id)?.toString?.(),
+      amount: Number(p.amount) || 0,
+      method: p.method,
+      paidAt: p.paidAt,
+      note: p.note || "",
+      isVoided: Boolean(p.isVoided),
+      voidReason: p.voidReason || "",
+      recordedBy: p.recordedBy?.name || null,
+    })),
     dueDate: json.dueDate || null,
     notes: json.notes || "",
     isCancelled: Boolean(json.isCancelled),
-    paidAt: json.paidAt || null,
     createdAt: json.createdAt,
     updatedAt: json.updatedAt,
   };

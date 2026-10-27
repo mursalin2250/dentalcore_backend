@@ -1,13 +1,7 @@
-import {
-  EXPIRY_FLAGS,
-  EXPIRY_SOON_DAYS,
-  SKU_PREFIX,
-  STOCK_MOVEMENT_TYPES,
-  STOCK_STATUSES,
-} from "../constants/inventory.js";
 import { HTTP_STATUS } from "../constants/httpStatus.js";
+import { STOCK_MOVEMENT_TYPES } from "../constants/inventory.js";
 import { MESSAGES } from "../constants/messages.js";
-import { Medication, deriveExpiryFlag, deriveStockStatus, shapeMedication } from "../models/Medication.js";
+import { Medication, shapeMedication } from "../models/Medication.js";
 import { StockMovement } from "../models/StockMovement.js";
 import { AppError } from "../utils/AppError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -16,20 +10,13 @@ import { sendSuccess } from "../utils/response.js";
 
 async function nextSku() {
   const count = await Medication.countDocuments({});
-  let attempt = count + 1;
-  for (let i = 0; i < 20; i += 1) {
-    const sku = `${SKU_PREFIX}-${String(attempt).padStart(4, "0")}`;
-    const exists = await Medication.exists({ sku });
-    if (!exists) return sku;
-    attempt += 1;
-  }
-  return `${SKU_PREFIX}-${Date.now().toString(36).toUpperCase()}`;
+  return `MED-${String(count + 1).padStart(5, "0")}`;
 }
 
-function parseExpiry(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d;
+async function findMedOrThrow(id) {
+  const med = await Medication.findById(id);
+  if (!med || med.isArchived) throw new AppError(MESSAGES.MEDICATION?.NOT_FOUND || "Medication not found.", HTTP_STATUS.NOT_FOUND);
+  return med;
 }
 
 export const getMedicationStats = asyncHandler(async (_req, res) => {
@@ -41,108 +28,67 @@ export const getMedicationStats = asyncHandler(async (_req, res) => {
         totalItems: { $sum: 1 },
         lowStockCount: {
           $sum: {
-            $cond: [
-              {
-                $and: [
-                  { $gt: ["$stock", 0] },
-                  { $lte: ["$stock", "$reorderLevel"] },
-                ],
-              },
-              1,
-              0,
-            ],
+            $cond: [{ $and: [{ $gt: ["$quantity", 0] }, { $lte: ["$quantity", "$reorderLevel"] }] }, 1, 0],
           },
         },
-        outOfStockCount: { $sum: { $cond: [{ $lte: ["$stock", 0] }, 1, 0] } },
-        inventoryValue: { $sum: { $multiply: ["$stock", "$unitPrice"] } },
+        outOfStockCount: { $sum: { $cond: [{ $lte: ["$quantity", 0] }, 1, 0] } },
+        inventoryValue: { $sum: { $multiply: ["$quantity", { $ifNull: ["$unitPrice", 0] }] } },
       },
     },
   ]);
   sendSuccess(res, {
     data: {
-      totalItems: agg?.totalItems ?? 0,
-      lowStockCount: agg?.lowStockCount ?? 0,
-      outOfStockCount: agg?.outOfStockCount ?? 0,
-      inventoryValue: agg?.inventoryValue ?? 0,
+      totalItems: agg?.totalItems || 0,
+      lowStockCount: agg?.lowStockCount || 0,
+      outOfStockCount: agg?.outOfStockCount || 0,
+      inventoryValue: agg?.inventoryValue || 0,
     },
   });
 });
 
 export const listMedications = asyncHandler(async (req, res) => {
-  const { search, category, itemType, status, expiry, page, limit, sort } = req.validated.query;
+  const { search, status, page = 1, limit = 12, sort = "-updatedAt" } = req.validated?.query || req.query;
   const filter = { isArchived: { $ne: true } };
-  if (category) filter.category = category;
-  if (itemType) filter.itemType = itemType;
   if (search) {
     const pattern = new RegExp(escapeRegex(search), "i");
-    filter.$or = [{ name: pattern }, { sku: pattern }];
+    filter.$or = [{ name: pattern }, { sku: pattern }, { category: pattern }];
   }
-  if (status === STOCK_STATUSES.OUT_OF_STOCK) {
-    filter.stock = { $lte: 0 };
-  } else if (status === STOCK_STATUSES.LOW_STOCK) {
-    filter.$expr = {
-      $and: [{ $gt: ["$stock", 0] }, { $lte: ["$stock", "$reorderLevel"] }],
-    };
-  } else if (status === STOCK_STATUSES.IN_STOCK) {
-    filter.$expr = { $gt: ["$stock", "$reorderLevel"] };
-  }
-  if (expiry === EXPIRY_FLAGS.EXPIRED) {
-    filter.expiryDate = { $lt: new Date() };
-  } else if (expiry === EXPIRY_FLAGS.EXPIRING_SOON) {
-    const now = new Date();
-    const soon = new Date(now);
-    soon.setDate(soon.getDate() + EXPIRY_SOON_DAYS);
-    filter.expiryDate = { $gte: now, $lte: soon };
-  } else if (expiry === EXPIRY_FLAGS.NONE) {
-    filter.$or = [...(filter.$or ? [{ $or: filter.$or }] : []), { expiryDate: null }, { expiryDate: { $exists: false } }];
-    delete filter.$or;
-    filter.expiryDate = null;
-  }
+  const skip = (Number(page) - 1) * Number(limit);
+  const sortSpec = String(sort).startsWith("-") ? { [String(sort).slice(1)]: -1 } : { [sort]: 1 };
 
-  const sortKey = sort || "-updatedAt";
-  const sortSpec = sortKey.startsWith("-") ? { [sortKey.slice(1)]: -1 } : { [sortKey]: 1 };
-  const [rows, total] = await Promise.all([
-    Medication.find(filter)
-      .sort(sortSpec)
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    Medication.countDocuments(filter),
-  ]);
+  let rows = await Medication.find(filter).sort(sortSpec).skip(skip).limit(Number(limit));
+  let total = await Medication.countDocuments(filter);
+  let medications = rows.map(shapeMedication);
+  if (status) medications = medications.filter((m) => m.status === status);
 
   sendSuccess(res, {
     data: {
-      medications: rows.map(shapeMedication),
-      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      medications,
+      pagination: { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) || 1 },
     },
   });
 });
 
 export const getMedication = asyncHandler(async (req, res) => {
-  const med = await Medication.findById(req.validated.params.id).lean();
-  if (!med || med.isArchived) throw new AppError(MESSAGES.MEDICATION.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  const med = await findMedOrThrow(req.validated.params.id);
   sendSuccess(res, { data: { medication: shapeMedication(med) } });
 });
 
 export const createMedication = asyncHandler(async (req, res) => {
-  const body = req.validated.body;
-  const sku = (body.sku || "").trim() || (await nextSku());
-  const exists = await Medication.exists({ sku });
-  if (exists) throw new AppError(MESSAGES.MEDICATION.SKU_TAKEN, HTTP_STATUS.CONFLICT);
+  const body = { ...req.validated.body };
+  if (!body.sku) body.sku = await nextSku();
+  else {
+    body.sku = String(body.sku).trim().toUpperCase();
+    if (await Medication.exists({ sku: body.sku })) {
+      throw new AppError("SKU already exists.", HTTP_STATUS.CONFLICT, { sku: "SKU already exists." });
+    }
+  }
+  const initialStock = Math.max(0, Number(body.quantity) || 0);
+  body.quantity = initialStock;
+  body.unitPrice = Math.max(0, Number(body.unitPrice) || 0);
+  body.reorderLevel = Math.max(0, Number(body.reorderLevel) || 0);
 
-  const initialStock = body.initialStock ?? 0;
-  const med = await Medication.create({
-    name: body.name,
-    sku,
-    itemType: body.itemType,
-    category: body.category,
-    unit: body.unit,
-    stock: initialStock,
-    reorderLevel: body.reorderLevel ?? 0,
-    unitPrice: body.unitPrice ?? 0,
-    expiryDate: parseExpiry(body.expiryDate),
-    supplier: body.supplier || "",
-  });
+  const med = await Medication.create(body);
 
   if (initialStock > 0) {
     await StockMovement.create({
@@ -151,53 +97,43 @@ export const createMedication = asyncHandler(async (req, res) => {
       quantity: initialStock,
       stockBefore: 0,
       stockAfter: initialStock,
-      reason: "Purchase",
-      note: "Initial stock on create",
+      reason: "Initial stock",
       performedBy: req.user?._id || null,
     });
   }
 
   sendSuccess(res, {
     status: HTTP_STATUS.CREATED,
-    message: MESSAGES.MEDICATION.CREATED,
     data: { medication: shapeMedication(med) },
+    message: "Medication created.",
   });
 });
 
 export const updateMedication = asyncHandler(async (req, res) => {
-  const med = await Medication.findById(req.validated.params.id);
-  if (!med || med.isArchived) throw new AppError(MESSAGES.MEDICATION.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
+  const med = await findMedOrThrow(req.validated.params.id);
   const changes = { ...req.validated.body };
-  if (changes.sku && changes.sku !== med.sku) {
-    const taken = await Medication.exists({ sku: changes.sku, _id: { $ne: med._id } });
-    if (taken) throw new AppError(MESSAGES.MEDICATION.SKU_TAKEN, HTTP_STATUS.CONFLICT);
-  }
-  if ("expiryDate" in changes) changes.expiryDate = parseExpiry(changes.expiryDate);
-  // Never allow direct stock edits via this route.
-  delete changes.stock;
-  delete changes.initialStock;
+  // Stock is only changed via movements
   delete changes.quantity;
-
+  if (changes.sku) {
+    changes.sku = String(changes.sku).trim().toUpperCase();
+    if (await Medication.exists({ sku: changes.sku, _id: { $ne: med._id } })) {
+      throw new AppError("SKU already exists.", HTTP_STATUS.CONFLICT, { sku: "SKU already exists." });
+    }
+  }
   Object.assign(med, changes);
   await med.save();
-  sendSuccess(res, {
-    message: MESSAGES.MEDICATION.UPDATED,
-    data: { medication: shapeMedication(med) },
-  });
+  sendSuccess(res, { data: { medication: shapeMedication(med) }, message: "Medication updated." });
 });
 
 export const removeMedication = asyncHandler(async (req, res) => {
-  const med = await Medication.findById(req.validated.params.id);
-  if (!med) throw new AppError(MESSAGES.MEDICATION.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-  const movementCount = await StockMovement.countDocuments({ medication: med._id });
-  if (movementCount === 0) {
-    await med.deleteOne();
-    sendSuccess(res, { message: MESSAGES.MEDICATION.DELETED, data: { archived: false } });
+  const med = await findMedOrThrow(req.validated.params.id);
+  const hasMovements = await StockMovement.exists({ medication: med._id });
+  if (hasMovements) {
+    med.isArchived = true;
+    await med.save();
+    sendSuccess(res, { message: "Medication archived (has movement history)." });
     return;
   }
-  med.isArchived = true;
-  await med.save();
-  sendSuccess(res, { message: MESSAGES.MEDICATION.ARCHIVED, data: { archived: true } });
+  await med.deleteOne();
+  sendSuccess(res, { message: "Medication deleted." });
 });

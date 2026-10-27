@@ -1,12 +1,11 @@
 import {
   INVOICE_NUMBER_PAD,
   INVOICE_NUMBER_PREFIX,
-  INVOICE_OVERDUE_DAYS,
   INVOICE_STATUSES,
+  PAYMENT_METHODS,
 } from "../constants/billing.js";
 import { HTTP_STATUS } from "../constants/httpStatus.js";
 import { MESSAGES } from "../constants/messages.js";
-import { Doctor } from "../models/Doctor.js";
 import {
   Invoice,
   deriveInvoiceStatus,
@@ -17,9 +16,10 @@ import { Patient } from "../models/Patient.js";
 import { AppError } from "../utils/AppError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
+import { computeInvoiceTotals } from "../utils/invoiceTotals.js";
 import { sendSuccess } from "../utils/response.js";
 
-async function nextInvoiceNumber() {
+export async function nextInvoiceNumber() {
   const count = await Invoice.countDocuments({});
   let n = count + 1;
   for (let i = 0; i < 30; i += 1) {
@@ -33,10 +33,9 @@ async function nextInvoiceNumber() {
 
 async function findInvoiceOrThrow(id) {
   const invoice = await Invoice.findById(id)
-    .populate("patient", "name")
+    .populate("patient", "name phone address")
     .populate("doctor", "name")
-    .populate("payments.recordedBy", "name")
-    .populate("payments.voidedBy", "name");
+    .populate("payments.recordedBy", "name");
   if (!invoice) throw new AppError(MESSAGES.INVOICE.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
   return invoice;
 }
@@ -47,144 +46,108 @@ function parseDate(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** Mongo match fragments for derived status (never stored). */
-export function statusMatch(status, now = new Date()) {
-  const overdueAnchor = new Date(now.getTime() - INVOICE_OVERDUE_DAYS * 24 * 60 * 60 * 1000);
-  if (status === INVOICE_STATUSES.CANCELLED) return { isCancelled: true };
-  if (status === INVOICE_STATUSES.PAID) {
-    return {
-      isCancelled: { $ne: true },
-      $expr: { $lte: [{ $subtract: ["$totalCost", "$amountPaid"] }, 0] },
-    };
+/** Create starter invoice when a patient is registered. */
+export async function createStarterInvoiceForPatient(patient) {
+  const existing = await Invoice.findOne({ patient: patient._id });
+  if (existing) return existing;
+
+  const treatmentCost = Math.max(0, Number(patient.treatmentCost) || 0);
+  const amountPaid = Math.max(0, Number(patient.amountPaid) || 0);
+  const treatmentLabel = (patient.treatment || "").trim() || "Consultation";
+  const invoiceNumber = await nextInvoiceNumber();
+  const lineItems = [{ description: treatmentLabel, quantity: 1, rate: treatmentCost }];
+  const payments = [];
+  if (amountPaid > 0) {
+    payments.push({
+      amount: amountPaid,
+      method: PAYMENT_METHODS.CASH,
+      paidAt: new Date(),
+      note: "Initial payment on registration",
+      isVoided: false,
+    });
   }
-  if (status === INVOICE_STATUSES.OVERDUE) {
-    return {
-      isCancelled: { $ne: true },
-      $expr: { $gt: [{ $subtract: ["$totalCost", "$amountPaid"] }, 0] },
-      $or: [
-        {
-          $and: [
-            { "payments.0": { $exists: true } },
-            {
-              $expr: {
-                $lt: [
-                  {
-                    $max: {
-                      $map: {
-                        input: {
-                          $filter: {
-                            input: { $ifNull: ["$payments", []] },
-                            as: "p",
-                            cond: { $ne: ["$$p.isVoided", true] },
-                          },
-                        },
-                        as: "p",
-                        in: "$$p.paidAt",
-                      },
-                    },
-                  },
-                  overdueAnchor,
-                ],
-              },
-            },
-          ],
-        },
-        {
-          $and: [
-            { $or: [{ payments: { $size: 0 } }, { payments: { $exists: false } }] },
-            { createdAt: { $lt: overdueAnchor } },
-          ],
-        },
-      ],
-    };
-  }
-  if (status === INVOICE_STATUSES.PENDING) {
-    return {
-      isCancelled: { $ne: true },
-      $expr: { $gt: [{ $subtract: ["$totalCost", "$amountPaid"] }, 0] },
-    };
-  }
-  return {};
+
+  return Invoice.create({
+    invoiceNumber,
+    number: invoiceNumber,
+    patient: patient._id,
+    patientName: patient.name || "",
+    patientPhone: patient.phone || "",
+    patientAddress: patient.address || "",
+    doctor: patient.doctor || null,
+    problem: patient.problem || "",
+    treatment: treatmentLabel,
+    lineItems,
+    discountMinor: 0,
+    terms: "Please make payment by the due date.",
+    totalCost: treatmentCost,
+    totalAmount: treatmentCost,
+    amountPaid,
+    payments,
+    notes: "",
+    isCancelled: false,
+    status: amountPaid >= treatmentCost && treatmentCost > 0 ? INVOICE_STATUSES.PAID : INVOICE_STATUSES.PENDING,
+  });
 }
 
 export const getInvoiceStats = asyncHandler(async (_req, res) => {
-  const now = new Date();
-  const invoices = await Invoice.find({}).select("totalCost amountPaid isCancelled payments createdAt").lean();
-  let pending = 0;
-  let paid = 0;
-  let overdue = 0;
-  let cancelled = 0;
+  const invoices = await Invoice.find({ isCancelled: false }).select(
+    "totalCost amountPaid payments createdAt isCancelled",
+  );
   let outstanding = 0;
   let collected = 0;
+  let pending = 0;
+  let overdue = 0;
   for (const inv of invoices) {
-    const status = deriveInvoiceStatus(inv, now);
-    const due = Math.max(0, Number(inv.totalCost || 0) - Number(inv.amountPaid || 0));
-    if (status === INVOICE_STATUSES.CANCELLED) cancelled += 1;
-    else if (status === INVOICE_STATUSES.PAID) {
-      paid += 1;
-      collected += Number(inv.amountPaid || 0);
-    } else if (status === INVOICE_STATUSES.OVERDUE) {
-      overdue += 1;
-      outstanding += due;
-    } else {
-      pending += 1;
-      outstanding += due;
-    }
+    recomputePaid(inv);
+    const status = deriveInvoiceStatus(inv);
+    const due = Math.max(0, Number(inv.totalCost) - Number(inv.amountPaid));
+    outstanding += due;
+    collected += Number(inv.amountPaid) || 0;
+    if (status === INVOICE_STATUSES.PENDING) pending += 1;
+    if (status === INVOICE_STATUSES.OVERDUE) overdue += 1;
   }
   sendSuccess(res, {
-    data: {
-      total: invoices.length,
-      pending,
-      paid,
-      overdue,
-      cancelled,
-      outstanding,
-      collected,
-    },
+    data: { outstanding, collected, pending, overdue },
   });
 });
 
 export const listInvoices = asyncHandler(async (req, res) => {
-  const { search, status, patient, doctor, from, to, page, limit, sort } = req.validated.query;
+  const { search, status, patient, page, limit, sort } = req.validated.query;
   const filter = {};
   if (patient) filter.patient = patient;
-  if (doctor) filter.doctor = doctor;
-  if (from || to) {
-    filter.createdAt = {};
-    if (from) filter.createdAt.$gte = new Date(from);
-    if (to) filter.createdAt.$lte = new Date(to);
-  }
-  if (status) Object.assign(filter, statusMatch(status));
   if (search) {
     const pattern = new RegExp(escapeRegex(search), "i");
-    const patients = await Patient.find({ name: pattern }).select("_id").lean();
+    const patients = await Patient.find({ name: pattern }).select("_id").limit(50);
     filter.$or = [
       { invoiceNumber: pattern },
       { number: pattern },
+      { patientName: pattern },
       { patient: { $in: patients.map((p) => p._id) } },
-      { problem: pattern },
       { treatment: pattern },
     ];
   }
 
-  const sortKey = sort || "-updatedAt";
-  const sortSpec = sortKey.startsWith("-") ? { [sortKey.slice(1)]: -1 } : { [sortKey]: 1 };
+  const skip = (page - 1) * limit;
+  const sortSpec = sort?.startsWith("-") ? { [sort.slice(1)]: -1 } : { [sort || "updatedAt"]: -1 };
 
   const [rows, total] = await Promise.all([
     Invoice.find(filter)
       .sort(sortSpec)
-      .skip((page - 1) * limit)
+      .skip(skip)
       .limit(limit)
-      .populate("patient", "name")
-      .populate("doctor", "name")
-      .lean(),
+      .populate("patient", "name phone address")
+      .populate("doctor", "name"),
     Invoice.countDocuments(filter),
   ]);
 
+  let invoices = rows.map((r) => shapeInvoice(r));
+  if (status) invoices = invoices.filter((i) => i.status === status);
+
   sendSuccess(res, {
     data: {
-      invoices: rows.map(shapeInvoice),
-      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      invoices,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) || 1 },
     },
   });
 });
@@ -194,75 +157,109 @@ export const getInvoice = asyncHandler(async (req, res) => {
   sendSuccess(res, { data: { invoice: shapeInvoice(invoice) } });
 });
 
-export const getInvoiceByPatient = asyncHandler(async (req, res) => {
-  const invoice = await Invoice.findOne({ patient: req.validated.params.id })
-    .populate("patient", "name")
-    .populate("doctor", "name")
-    .populate("payments.recordedBy", "name")
-    .populate("payments.voidedBy", "name");
-  sendSuccess(res, { data: { invoice: invoice ? shapeInvoice(invoice) : null } });
-});
-
 export const createInvoice = asyncHandler(async (req, res) => {
   const body = req.validated.body;
-  const patient = await Patient.findById(body.patient).select("_id");
-  if (!patient) throw new AppError(MESSAGES.PATIENT.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  let patientId = body.patient || null;
+  let patientName = (body.patientName || "").trim();
+  let patientPhone = (body.patientPhone || "").trim();
+  let patientAddress = (body.patientAddress || "").trim();
 
-  const existing = await Invoice.findOne({ patient: body.patient });
-  if (existing) throw new AppError(MESSAGES.INVOICE.PATIENT_HAS_INVOICE, HTTP_STATUS.CONFLICT);
-
-  if (body.doctor) {
-    const doctor = await Doctor.findById(body.doctor).select("_id");
-    if (!doctor) throw new AppError(MESSAGES.DOCTOR.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  if (patientId) {
+    const patient = await Patient.findById(patientId).select("_id name phone address");
+    if (!patient) throw new AppError(MESSAGES.PATIENT.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+    patientName = patientName || patient.name || "";
+    patientPhone = patientPhone || patient.phone || "";
+    patientAddress = patientAddress || patient.address || "";
+    const existing = await Invoice.findOne({ patient: patientId });
+    if (existing) throw new AppError(MESSAGES.INVOICE.PATIENT_HAS_INVOICE, HTTP_STATUS.CONFLICT);
+  }
+  if (!patientId && !patientName) {
+    throw new AppError("Enter a patient name or select a patient.", HTTP_STATUS.BAD_REQUEST);
   }
 
+  const lineItems = body.lineItems || [];
+  const totals = computeInvoiceTotals(lineItems, { discountMinor: body.discountMinor ?? 0 });
+  const totalCost = lineItems.length > 0 ? totals.total : body.totalCost ?? 0;
   const invoiceNumber = await nextInvoiceNumber();
-  const totalCost = body.totalCost ?? 0;
+
+  const initialPayment = Math.max(0, Number(body.initialPayment) || 0);
+  const payments = [];
+  if (initialPayment > 0) {
+    payments.push({
+      amount: Math.min(initialPayment, totalCost || initialPayment),
+      method: PAYMENT_METHODS.CASH,
+      paidAt: new Date(),
+      note: "Initial payment",
+      recordedBy: req.user?._id || null,
+      isVoided: false,
+    });
+  }
+
   const invoice = await Invoice.create({
     invoiceNumber,
     number: invoiceNumber,
-    patient: body.patient,
+    patient: patientId,
+    patientName,
+    patientPhone,
+    patientAddress,
     doctor: body.doctor || null,
     problem: body.problem || "",
-    treatment: body.treatment || "",
+    treatment: body.treatment || lineItems.map((i) => i.description).filter(Boolean).join(", "),
+    lineItems,
+    discountMinor: body.discountMinor ?? 0,
+    terms: body.terms || "",
+    logoDataUrl: body.logoDataUrl || "",
     totalCost,
     totalAmount: totalCost,
     amountPaid: 0,
-    payments: [],
+    payments,
     dueDate: parseDate(body.dueDate),
     notes: body.notes || "",
     isCancelled: false,
-    status: INVOICE_STATUSES.PENDING,
   });
+  recomputePaid(invoice);
+  await invoice.save();
 
   const populated = await findInvoiceOrThrow(invoice._id);
   sendSuccess(res, {
     status: HTTP_STATUS.CREATED,
-    message: MESSAGES.INVOICE.CREATED,
     data: { invoice: shapeInvoice(populated) },
+    message: MESSAGES.INVOICE.CREATED,
   });
 });
 
 export const updateInvoice = asyncHandler(async (req, res) => {
   const invoice = await findInvoiceOrThrow(req.validated.params.id);
+  if (invoice.isCancelled) throw new AppError(MESSAGES.INVOICE.CANCELLED, HTTP_STATUS.BAD_REQUEST);
   const changes = { ...req.validated.body };
+
   if ("dueDate" in changes) changes.dueDate = parseDate(changes.dueDate);
-  if ("totalCost" in changes) {
+  if (changes.lineItems) {
+    const totals = computeInvoiceTotals(changes.lineItems, {
+      discountMinor: changes.discountMinor ?? invoice.discountMinor ?? 0,
+    });
+    changes.totalCost = totals.total;
+    changes.totalAmount = totals.total;
+    if (!changes.treatment) {
+      changes.treatment = changes.lineItems.map((i) => i.description).filter(Boolean).join(", ");
+    }
+  } else if ("totalCost" in changes) {
     changes.totalAmount = changes.totalCost;
   }
-  if (changes.doctor) {
-    const doctor = await Doctor.findById(changes.doctor).select("_id");
-    if (!doctor) throw new AppError(MESSAGES.DOCTOR.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-  }
+
   Object.assign(invoice, changes);
-  recomputePaid(invoice);
-  invoice.status = deriveInvoiceStatus(invoice);
   await invoice.save();
-  const populated = await findInvoiceOrThrow(invoice._id);
+  const refreshed = await findInvoiceOrThrow(invoice._id);
   sendSuccess(res, {
+    data: { invoice: shapeInvoice(refreshed) },
     message: MESSAGES.INVOICE.UPDATED,
-    data: { invoice: shapeInvoice(populated) },
   });
+});
+
+export const removeInvoice = asyncHandler(async (req, res) => {
+  const invoice = await findInvoiceOrThrow(req.validated.params.id);
+  await invoice.deleteOne();
+  sendSuccess(res, { message: MESSAGES.INVOICE.DELETED });
 });
 
 export const addPayment = asyncHandler(async (req, res) => {
@@ -272,12 +269,8 @@ export const addPayment = asyncHandler(async (req, res) => {
   const amount = Number(req.validated.body.amount);
   recomputePaid(invoice);
   const due = Math.max(0, Number(invoice.totalCost) - Number(invoice.amountPaid));
-  if (due <= 0) {
-    throw new AppError(MESSAGES.INVOICE.ALREADY_PAID || "This invoice is already fully paid.", HTTP_STATUS.BAD_REQUEST);
-  }
-  if (amount > due) {
-    throw new AppError(MESSAGES.INVOICE.PAYMENT_EXCEEDS_DUE, HTTP_STATUS.BAD_REQUEST);
-  }
+  if (due <= 0) throw new AppError(MESSAGES.INVOICE.ALREADY_PAID, HTTP_STATUS.BAD_REQUEST);
+  if (amount > due) throw new AppError(MESSAGES.INVOICE.PAYMENT_EXCEEDS_DUE, HTTP_STATUS.BAD_REQUEST);
 
   invoice.payments.push({
     amount,
@@ -285,47 +278,27 @@ export const addPayment = asyncHandler(async (req, res) => {
     paidAt: parseDate(req.validated.body.paidAt) || new Date(),
     note: req.validated.body.note || "",
     recordedBy: req.user?._id || null,
+    isVoided: false,
   });
   recomputePaid(invoice);
-  invoice.status = deriveInvoiceStatus(invoice);
   await invoice.save();
-  const populated = await findInvoiceOrThrow(invoice._id);
+  const refreshed = await findInvoiceOrThrow(invoice._id);
   sendSuccess(res, {
-    status: HTTP_STATUS.CREATED,
+    data: { invoice: shapeInvoice(refreshed) },
     message: MESSAGES.INVOICE.PAYMENT_ADDED,
-    data: { invoice: shapeInvoice(populated) },
   });
 });
 
 export const voidPayment = asyncHandler(async (req, res) => {
   const invoice = await findInvoiceOrThrow(req.validated.params.id);
   const payment = invoice.payments.id(req.validated.params.paymentId);
-  if (!payment) throw new AppError(MESSAGES.INVOICE.PAYMENT_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-  if (payment.isVoided) throw new AppError(MESSAGES.INVOICE.PAYMENT_ALREADY_VOIDED, HTTP_STATUS.BAD_REQUEST);
-
+  if (!payment) throw new AppError("Payment not found.", HTTP_STATUS.NOT_FOUND);
   payment.isVoided = true;
   payment.voidReason = req.validated.body.voidReason;
   payment.voidedBy = req.user?._id || null;
   payment.voidedAt = new Date();
   recomputePaid(invoice);
-  invoice.status = deriveInvoiceStatus(invoice);
   await invoice.save();
-  const populated = await findInvoiceOrThrow(invoice._id);
-  sendSuccess(res, {
-    message: MESSAGES.INVOICE.PAYMENT_VOIDED,
-    data: { invoice: shapeInvoice(populated) },
-  });
-});
-
-export const removeInvoice = asyncHandler(async (req, res) => {
-  const invoice = await findInvoiceOrThrow(req.validated.params.id);
-  if (invoice.payments?.some((p) => !p.isVoided)) {
-    invoice.isCancelled = true;
-    invoice.status = INVOICE_STATUSES.CANCELLED;
-    await invoice.save();
-    sendSuccess(res, { message: MESSAGES.INVOICE.CANCELLED_MSG, data: { invoice: shapeInvoice(invoice) } });
-    return;
-  }
-  await invoice.deleteOne();
-  sendSuccess(res, { message: MESSAGES.INVOICE.DELETED, data: { deleted: true } });
+  const refreshed = await findInvoiceOrThrow(invoice._id);
+  sendSuccess(res, { data: { invoice: shapeInvoice(refreshed) }, message: MESSAGES.INVOICE.UPDATED });
 });

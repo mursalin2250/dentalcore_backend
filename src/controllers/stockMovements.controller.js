@@ -1,155 +1,125 @@
-import {
-  INVENTORY_STATS_WINDOW_DAYS,
-  STOCK_MOVEMENT_TYPES,
-} from "../constants/inventory.js";
 import { HTTP_STATUS } from "../constants/httpStatus.js";
-import { MESSAGES } from "../constants/messages.js";
-import { TIMEZONE } from "../constants/locale.js";
+import { STOCK_MOVEMENT_TYPES } from "../constants/inventory.js";
 import { Medication } from "../models/Medication.js";
 import { StockMovement, shapeStockMovement } from "../models/StockMovement.js";
 import { AppError } from "../utils/AppError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { escapeRegex } from "../utils/escapeRegex.js";
-import { startOfDay, addDays } from "../utils/dates.js";
 import { sendSuccess } from "../utils/response.js";
 
+function startOfToday() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 function daysAgo(n) {
-  const d = startOfDay();
-  return addDays(d, -n);
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  d.setHours(0, 0, 0, 0);
+  return d;
 }
 
 export const getStockMovementStats = asyncHandler(async (_req, res) => {
-  const todayStart = startOfDay();
-  const todayEnd = addDays(todayStart, 1);
-  const windowStart = daysAgo(INVENTORY_STATS_WINDOW_DAYS);
-
-  const [movementsToday, inAgg, outAgg, adjustmentsCount] = await Promise.all([
-    StockMovement.countDocuments({ createdAt: { $gte: todayStart, $lt: todayEnd } }),
+  const today = startOfToday();
+  const ago30 = daysAgo(30);
+  const [todayCount, in30, out30, adj30] = await Promise.all([
+    StockMovement.countDocuments({ createdAt: { $gte: today } }),
     StockMovement.aggregate([
-      { $match: { type: STOCK_MOVEMENT_TYPES.IN, createdAt: { $gte: windowStart } } },
-      { $group: { _id: null, units: { $sum: "$quantity" } } },
+      { $match: { type: STOCK_MOVEMENT_TYPES.IN, createdAt: { $gte: ago30 } } },
+      { $group: { _id: null, total: { $sum: "$quantity" } } },
     ]),
     StockMovement.aggregate([
-      { $match: { type: STOCK_MOVEMENT_TYPES.OUT, createdAt: { $gte: windowStart } } },
-      { $group: { _id: null, units: { $sum: "$quantity" } } },
+      { $match: { type: STOCK_MOVEMENT_TYPES.OUT, createdAt: { $gte: ago30 } } },
+      { $group: { _id: null, total: { $sum: "$quantity" } } },
     ]),
-    StockMovement.countDocuments({
-      type: STOCK_MOVEMENT_TYPES.ADJUST,
-      createdAt: { $gte: windowStart },
-    }),
+    StockMovement.countDocuments({ type: STOCK_MOVEMENT_TYPES.ADJUST, createdAt: { $gte: ago30 } }),
   ]);
-
   sendSuccess(res, {
     data: {
-      movementsToday,
-      stockInUnits: inAgg[0]?.units ?? 0,
-      stockOutUnits: outAgg[0]?.units ?? 0,
-      adjustmentsCount,
+      movementsToday: todayCount,
+      stockIn30d: in30[0]?.total || 0,
+      stockOut30d: out30[0]?.total || 0,
+      adjustments30d: adj30,
     },
   });
 });
 
 export const listStockMovements = asyncHandler(async (req, res) => {
-  const { search, type, medication, from, to, page, limit } = req.validated.query;
+  const { search, type, medication, page = 1, limit = 12 } = req.validated?.query || req.query;
   const filter = {};
   if (type) filter.type = type;
   if (medication) filter.medication = medication;
-  if (from || to) {
-    filter.createdAt = {};
-    if (from) filter.createdAt.$gte = new Date(from);
-    if (to) filter.createdAt.$lte = new Date(to);
-  }
-  if (search) {
-    const pattern = new RegExp(escapeRegex(search), "i");
-    const meds = await Medication.find({ $or: [{ name: pattern }, { sku: pattern }] })
-      .select("_id")
-      .lean();
-    filter.medication = { $in: meds.map((m) => m._id) };
-  }
+
+  const skip = (Number(page) - 1) * Number(limit);
+  let query = StockMovement.find(filter)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(Number(limit))
+    .populate("medication", "name sku unit unitPrice")
+    .populate("performedBy", "name");
 
   const [rows, total] = await Promise.all([
-    StockMovement.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .populate("medication", "name sku unit stock unitPrice")
-      .populate("performedBy", "name")
-      .lean(),
+    query,
     StockMovement.countDocuments(filter),
   ]);
 
+  let movements = rows.map(shapeStockMovement);
+  if (search) {
+    const q = String(search).toLowerCase();
+    movements = movements.filter((m) => (m.medication?.name || "").toLowerCase().includes(q));
+  }
+
   sendSuccess(res, {
     data: {
-      movements: rows.map(shapeStockMovement),
-      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      movements,
+      pagination: { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) || 1 },
     },
   });
 });
 
 export const createStockMovement = asyncHandler(async (req, res) => {
-  const body = req.validated.body;
-  const med = await Medication.findById(body.medication);
-  if (!med || med.isArchived) throw new AppError(MESSAGES.MEDICATION.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  const { medication: medId, type, quantity, reason, note } = req.validated.body;
+  const qty = Math.max(1, Math.round(Number(quantity) || 0));
 
-  const stockBefore = med.stock;
-  let quantity;
-  let stockAfter;
-  let filter = { _id: med._id };
+  const med = await Medication.findById(medId);
+  if (!med || med.isArchived) throw new AppError("Medication not found.", HTTP_STATUS.NOT_FOUND);
 
-  if (body.type === STOCK_MOVEMENT_TYPES.IN) {
-    quantity = body.quantity;
-    stockAfter = stockBefore + quantity;
-  } else if (body.type === STOCK_MOVEMENT_TYPES.OUT) {
-    quantity = body.quantity;
-    if (quantity > stockBefore) {
-      throw new AppError(MESSAGES.STOCK.INSUFFICIENT, HTTP_STATUS.BAD_REQUEST);
-    }
-    stockAfter = stockBefore - quantity;
-    // Race-safe: only succeed if stock is still enough.
-    filter = { _id: med._id, stock: { $gte: quantity } };
+  const before = Number(med.quantity) || 0;
+  let after = before;
+
+  if (type === STOCK_MOVEMENT_TYPES.IN) {
+    after = before + qty;
+  } else if (type === STOCK_MOVEMENT_TYPES.OUT) {
+    if (qty > before) throw new AppError("Not enough stock for this stock out.", HTTP_STATUS.BAD_REQUEST);
+    after = before - qty;
+  } else if (type === STOCK_MOVEMENT_TYPES.ADJUST) {
+    after = qty; // counted quantity becomes new stock
   } else {
-    // Adjust: counted quantity is the new stock level.
-    const counted = body.countedQuantity ?? 0;
-    stockAfter = counted;
-    quantity = Math.abs(counted - stockBefore) || 1;
+    throw new AppError("Invalid movement type.", HTTP_STATUS.BAD_REQUEST);
   }
 
-  const updated = await Medication.findOneAndUpdate(
-    filter,
-    { $set: { stock: stockAfter } },
-    { new: true },
-  );
-  if (!updated) {
-    throw new AppError(MESSAGES.STOCK.INSUFFICIENT, HTTP_STATUS.CONFLICT);
-  }
+  // Atomic-ish update
+  med.quantity = after;
+  await med.save();
 
-  let movement;
-  try {
-    movement = await StockMovement.create({
-      medication: med._id,
-      type: body.type,
-      quantity,
-      stockBefore,
-      stockAfter,
-      reason: body.reason,
-      note: body.note || "",
-      reference: body.reference || "",
-      performedBy: req.user?._id || null,
-    });
-  } catch (err) {
-    // Roll back stock if movement insert fails.
-    await Medication.findByIdAndUpdate(med._id, { $set: { stock: stockBefore } });
-    throw err;
-  }
+  const movement = await StockMovement.create({
+    medication: med._id,
+    type,
+    quantity: type === STOCK_MOVEMENT_TYPES.ADJUST ? Math.abs(after - before) || qty : qty,
+    stockBefore: before,
+    stockAfter: after,
+    reason: reason || "",
+    note: note || "",
+    performedBy: req.user?._id || null,
+  });
 
-  await movement.populate([
-    { path: "medication", select: "name sku unit stock unitPrice" },
-    { path: "performedBy", select: "name" },
-  ]);
+  const populated = await StockMovement.findById(movement._id)
+    .populate("medication", "name sku unit unitPrice")
+    .populate("performedBy", "name");
 
   sendSuccess(res, {
     status: HTTP_STATUS.CREATED,
-    message: MESSAGES.STOCK.CREATED,
-    data: { movement: shapeStockMovement(movement), medication: { id: updated._id.toString(), stock: updated.stock } },
+    data: { movement: shapeStockMovement(populated) },
+    message: "Stock movement recorded.",
   });
 });

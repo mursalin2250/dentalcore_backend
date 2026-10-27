@@ -38,20 +38,20 @@ const DOCTORS = [
   ["Rashed Karim", "Cosmetic Dentistry", "BDS, DDS", "01711000008"],
 ];
 
-// [name, unit, stock, reorderLevel, unitPrice minor BDT, category, itemType]
+// [name, unit, quantity, reorderLevel]. Several sit at or below the reorder level.
 const MEDICATIONS = [
-  ["Lidocaine 2%", "cartridges", 38, 60, 4500, "Anesthetic", "medicine"],
-  ["Articaine 4%", "cartridges", 22, 40, 5200, "Anesthetic", "medicine"],
-  ["Amoxicillin 500mg", "capsules", 410, 150, 800, "Antibiotic", "medicine"],
-  ["Ibuprofen 400mg", "tablets", 520, 200, 300, "Analgesic", "medicine"],
-  ["Metronidazole 400mg", "tablets", 64, 100, 500, "Antibiotic", "medicine"],
-  ["Chlorhexidine 0.2%", "bottles", 9, 12, 12000, "Antiseptic", "medicine"],
-  ["Composite resin A2", "syringes", 26, 10, 85000, "Consumable", "medicine"],
-  ["Dental floss", "boxes", 48, 20, 3500, "Consumable", "tool"],
-  ["Disposable gloves (M)", "boxes", 7, 15, 28000, "Consumable", "tool"],
-  ["Etching gel", "syringes", 18, 8, 15000, "Consumable", "medicine"],
-  ["Alginate impression", "bags", 14, 6, 22000, "Consumable", "tool"],
-  ["Surgical masks", "boxes", 31, 12, 18000, "Consumable", "tool"],
+  ["Lidocaine 2%", "cartridges", 38, 60],
+  ["Articaine 4%", "cartridges", 22, 40],
+  ["Amoxicillin 500mg", "capsules", 410, 150],
+  ["Ibuprofen 400mg", "tablets", 520, 200],
+  ["Metronidazole 400mg", "tablets", 64, 100],
+  ["Chlorhexidine 0.2%", "bottles", 9, 12],
+  ["Composite resin A2", "syringes", 26, 10],
+  ["Dental floss", "boxes", 48, 20],
+  ["Disposable gloves (M)", "boxes", 7, 15],
+  ["Etching gel", "syringes", 18, 8],
+  ["Alginate impression", "bags", 14, 6],
+  ["Surgical masks", "boxes", 31, 12],
 ];
 
 // [treatment, price in BDT]
@@ -129,13 +129,13 @@ function buildAppointments({ now, today, patients, doctors }) {
         const endsAt = new Date(startsAt.getTime() + VISIT_MINUTES * MINUTE_MS);
         const [treatment] = pick(TREATMENTS);
 
-        let status = APPOINTMENT_STATUSES.PENDING;
+        let status = APPOINTMENT_STATUSES.SCHEDULED;
         if (endsAt < now) {
           const roll = random();
           status =
             roll < 0.85 ? APPOINTMENT_STATUSES.COMPLETED : roll < 0.93 ? APPOINTMENT_STATUSES.CANCELLED : APPOINTMENT_STATUSES.NO_SHOW;
         } else if (startsAt <= now) {
-          status = APPOINTMENT_STATUSES.CONFIRMED;
+          status = APPOINTMENT_STATUSES.IN_CHAIR;
         }
 
         // Booked a few days ahead, but never in the future.
@@ -144,11 +144,8 @@ function buildAppointments({ now, today, patients, doctors }) {
           patient: pick(patients)._id,
           doctor: doctor._id,
           startsAt,
-          durationMinutes: VISIT_MINUTES,
           status,
-          reason: treatment,
           treatment,
-          notes: [],
           isDemo: true,
           ...stamp(bookedAt),
         });
@@ -160,83 +157,33 @@ function buildAppointments({ now, today, patients, doctors }) {
 
 function buildInvoices(appointments) {
   const prices = new Map(TREATMENTS);
-  // One invoice per patient: aggregate completed treatments.
-  const byPatient = new Map();
-  for (const a of appointments) {
-    if (a.status !== APPOINTMENT_STATUSES.COMPLETED) continue;
-    const key = String(a.patient);
-    const price = (prices.get(a.treatment) || 500) * CURRENCY_MINOR_UNIT;
-    const paidAt = new Date(a.startsAt.getTime() + VISIT_MINUTES * MINUTE_MS);
-    if (!byPatient.has(key)) {
-      byPatient.set(key, {
+  return appointments
+    .filter((a) => a.status === APPOINTMENT_STATUSES.COMPLETED)
+    .map((a, index) => {
+      const paidAt = new Date(a.startsAt.getTime() + VISIT_MINUTES * MINUTE_MS);
+      const isPaid = random() < 0.95;
+      return {
+        // DEMO- prefix keeps these away from real invoice numbers.
+        number: `DEMO-INV-${String(index + 1).padStart(6, "0")}`,
         patient: a.patient,
-        doctor: a.doctor,
-        totalCost: 0,
-        treatments: [],
-        payments: [],
-        lastAt: paidAt,
-      });
-    }
-    const row = byPatient.get(key);
-    row.totalCost += price;
-    row.treatments.push(a.treatment);
-    if (random() < 0.85) {
-      row.payments.push({
-        amount: price,
-        method: "cash",
-        paidAt,
-        note: a.treatment || "",
-        isVoided: false,
-      });
-    }
-    if (paidAt > row.lastAt) row.lastAt = paidAt;
-  }
-  let index = 0;
-  return [...byPatient.values()].map((row) => {
-    index += 1;
-    const amountPaid = row.payments.reduce((s, p) => s + p.amount, 0);
-    const invoiceNumber = `DEMO-INV-${String(index).padStart(6, "0")}`;
-    return {
-      invoiceNumber,
-      number: invoiceNumber,
-      patient: row.patient,
-      doctor: row.doctor,
-      problem: "",
-      treatment: row.treatments.slice(-3).join(", "),
-      totalCost: row.totalCost,
-      totalAmount: row.totalCost,
-      amountPaid,
-      payments: row.payments,
-      isCancelled: false,
-      status: amountPaid >= row.totalCost ? INVOICE_STATUSES.PAID : INVOICE_STATUSES.PENDING,
-      paidAt: row.payments.length ? row.lastAt : null,
-      isDemo: true,
-      ...stamp(row.lastAt),
-    };
-  });
+        totalAmount: prices.get(a.treatment) * CURRENCY_MINOR_UNIT,
+        status: isPaid ? INVOICE_STATUSES.PAID : INVOICE_STATUSES.PENDING,
+        paidAt: isPaid ? paidAt : null,
+        isDemo: true,
+        ...stamp(paidAt),
+      };
+    });
 }
 
 function buildStockMovements({ now, medications }) {
   const docs = [];
   for (const medication of medications) {
-    let running = medication.stock ?? 0;
-    for (let i = 0; i < 12; i++) {
-      const isRestock = random() < 0.2;
-      const type = isRestock ? STOCK_MOVEMENT_TYPES.IN : STOCK_MOVEMENT_TYPES.OUT;
-      const qty = isRestock ? int(10, 80) : int(1, Math.min(15, Math.max(1, running)));
-      const stockBefore = running;
-      const stockAfter = isRestock ? running + qty : Math.max(0, running - qty);
-      running = stockAfter;
+    for (let i = 0; i < 25; i++) {
+      const isRestock = random() < 0.15;
       docs.push({
         medication: medication._id,
-        type,
-        quantity: qty,
-        stockBefore,
-        stockAfter,
-        reason: isRestock ? "Purchase" : "Used",
-        note: "",
-        reference: "",
-        performedBy: null,
+        type: isRestock ? STOCK_MOVEMENT_TYPES.IN : STOCK_MOVEMENT_TYPES.OUT,
+        quantity: isRestock ? int(50, 200) : int(1, 20),
         isDemo: true,
         ...stamp(new Date(now.getTime() - int(5, 60 * 24 * 60) * MINUTE_MS)),
       });
@@ -268,17 +215,11 @@ async function seedDemo() {
     );
     const medications = await insert(
       Medication,
-      MEDICATIONS.map(([name, unit, stock, reorderLevel, unitPrice, category, itemType], i) => ({
+      MEDICATIONS.map(([name, unit, quantity, reorderLevel]) => ({
         name,
-        sku: `MED-${String(i + 1).padStart(4, "0")}`,
         unit,
-        stock,
+        quantity,
         reorderLevel,
-        unitPrice,
-        category,
-        itemType,
-        supplier: "Demo Supplier",
-        isArchived: false,
         isDemo: true,
         ...stamp(now),
       })),

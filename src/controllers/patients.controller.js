@@ -3,6 +3,7 @@ import { MESSAGES } from "../constants/messages.js";
 import { APPOINTMENT_STATUSES, PATIENT_STATUSES } from "../constants/statuses.js";
 import { Appointment } from "../models/Appointment.js";
 import { Invoice } from "../models/Invoice.js";
+import { createStarterInvoiceForPatient } from "./invoices.controller.js";
 import { Patient } from "../models/Patient.js";
 import { AppError } from "../utils/AppError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -32,29 +33,18 @@ function ageFromDob(dateOfBirth) {
   return age;
 }
 
-function shapeDoctorRef(doctor) {
-  if (!doctor) return null;
-  if (typeof doctor !== "object") {
-    return doctor.toString();
-  }
-  // After toJSON, populated docs use `id`; raw mongoose docs use `_id`.
-  const id = doctor.id || doctor._id;
-  if (!id) return null;
-  return {
-    id: id.toString(),
-    name: doctor.name || "",
-    specialty: doctor.specialty || "",
-    title: doctor.title || "",
-    phone: doctor.phone || "",
-    email: doctor.email || "",
-    avatarUrl: doctor.avatarUrl || null,
-  };
-}
-
 function shapePatient(doc, extras = {}) {
   const json = typeof doc.toJSON === "function" ? doc.toJSON() : { ...doc };
-  if (json.doctor) {
-    json.doctor = shapeDoctorRef(json.doctor);
+  if (json.doctor && typeof json.doctor === "object" && json.doctor._id) {
+    json.doctor = {
+      id: json.doctor._id.toString(),
+      name: json.doctor.name,
+      specialty: json.doctor.specialty || "",
+      title: json.doctor.title || "",
+      avatarUrl: json.doctor.avatarUrl || null,
+    };
+  } else if (json.doctor) {
+    json.doctor = json.doctor.toString();
   }
   const treatmentCost = Number(json.treatmentCost) || 0;
   const amountPaid = Number(json.amountPaid) || 0;
@@ -69,7 +59,7 @@ function shapePatient(doc, extras = {}) {
 }
 
 async function findPatientOrThrow(id) {
-  const patient = await Patient.findById(id).populate("doctor", "name specialty title phone email avatarUrl");
+  const patient = await Patient.findById(id).populate("doctor", "name specialty title avatarUrl");
   if (!patient) throw new AppError(MESSAGES.PATIENT.NOT_FOUND, HTTP_STATUS.NOT_FOUND);
   return patient;
 }
@@ -95,7 +85,7 @@ export const getPatientStats = asyncHandler(async (_req, res) => {
     Patient.countDocuments({ status: PATIENT_STATUSES.IN_TREATMENT }),
     Appointment.countDocuments({
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
+      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
     }),
   ]);
 
@@ -121,7 +111,7 @@ export const listPatients = asyncHandler(async (req, res) => {
 
   const [patients, total] = await Promise.all([
     Patient.find(filter)
-      .populate("doctor", "name specialty title phone email avatarUrl")
+      .populate("doctor", "name specialty title avatarUrl")
       .sort({ createdAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit),
@@ -193,7 +183,7 @@ export const getPatient = asyncHandler(async (req, res) => {
       .lean(),
     Invoice.find({ patient: patient._id })
       .sort({ createdAt: -1 })
-      .select("invoiceNumber number totalCost totalAmount amountPaid status paidAt createdAt")
+      .select("number totalAmount status paidAt createdAt")
       .lean(),
     Appointment.exists({ patient: patient._id }),
   ]);
@@ -206,8 +196,10 @@ export const getPatient = asyncHandler(async (req, res) => {
 
   const visit = visitAgg[0];
 
-  // Payments received on the patient's invoice reduce outstanding balance.
-  const paidFromInvoices = payments.reduce((sum, inv) => sum + (Number(inv.amountPaid) || 0), 0);
+  // Paid invoices reduce the outstanding balance alongside the stored amountPaid.
+  const paidFromInvoices = payments
+    .filter((inv) => inv.status === "paid")
+    .reduce((sum, inv) => sum + (inv.totalAmount || 0), 0);
   const amountPaid = Math.max(Number(patient.amountPaid) || 0, paidFromInvoices);
 
   sendSuccess(res, {
@@ -231,11 +223,8 @@ export const getPatient = asyncHandler(async (req, res) => {
       })),
       payments: payments.map((inv) => ({
         id: inv._id.toString(),
-        number: inv.invoiceNumber || inv.number,
-        invoiceNumber: inv.invoiceNumber || inv.number,
-        totalAmount: inv.totalCost ?? inv.totalAmount,
-        totalCost: inv.totalCost ?? inv.totalAmount,
-        amountPaid: inv.amountPaid ?? 0,
+        number: inv.number,
+        totalAmount: inv.totalAmount,
         status: inv.status,
         paidAt: inv.paidAt,
         createdAt: inv.createdAt,
@@ -265,7 +254,8 @@ export const createPatient = asyncHandler(async (req, res) => {
   if (body.amountPaid > body.treatmentCost) body.amountPaid = body.treatmentCost;
 
   const patient = await Patient.create(body);
-  const populated = await Patient.findById(patient._id).populate("doctor", "name specialty title phone email avatarUrl");
+  await createStarterInvoiceForPatient(patient);
+  const populated = await Patient.findById(patient._id).populate("doctor", "name specialty title avatarUrl");
   sendSuccess(res, {
     status: HTTP_STATUS.CREATED,
     data: { patient: shapePatient(populated, { lastVisit: null, visitCount: 0 }) },
@@ -313,7 +303,7 @@ export const updatePatient = asyncHandler(async (req, res) => {
 
   Object.assign(patient, changes);
   await patient.save();
-  const populated = await Patient.findById(patient._id).populate("doctor", "name specialty title phone email avatarUrl");
+  const populated = await Patient.findById(patient._id).populate("doctor", "name specialty title avatarUrl");
 
   const visitAgg = await Appointment.aggregate([
     {

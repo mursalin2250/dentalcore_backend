@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { STOCK_MOVEMENT_TYPE_VALUES } from "../constants/inventory.js";
+import { STOCK_MOVEMENT_TYPE_VALUES } from "../constants/statuses.js";
 import { demoFlag } from "./demoFlag.js";
 
 const stockMovementSchema = new mongoose.Schema(
@@ -7,16 +7,15 @@ const stockMovementSchema = new mongoose.Schema(
     medication: { type: mongoose.Schema.Types.ObjectId, ref: "Medication", required: true },
     type: { type: String, enum: STOCK_MOVEMENT_TYPE_VALUES, required: true },
     quantity: { type: Number, required: true, min: 1, validate: Number.isInteger },
-    stockBefore: { type: Number, required: true, min: 0, validate: Number.isInteger },
-    stockAfter: { type: Number, required: true, min: 0, validate: Number.isInteger },
-    reason: { type: String, required: true, trim: true },
+    stockBefore: { type: Number, min: 0, default: 0, validate: Number.isInteger },
+    stockAfter: { type: Number, min: 0, default: 0, validate: Number.isInteger },
+    reason: { type: String, trim: true, default: "" },
     note: { type: String, trim: true, default: "" },
-    reference: { type: String, trim: true, default: "" },
     performedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     ...demoFlag,
   },
   {
-    timestamps: { createdAt: true, updatedAt: false },
+    timestamps: true,
     toJSON: {
       transform: (_doc, ret) => {
         ret.id = ret._id.toString();
@@ -28,51 +27,30 @@ const stockMovementSchema = new mongoose.Schema(
   },
 );
 
-stockMovementSchema.index({ medication: 1, createdAt: -1 });
-stockMovementSchema.index({ type: 1 });
 stockMovementSchema.index({ createdAt: -1 });
+stockMovementSchema.index({ medication: 1, createdAt: -1 });
+stockMovementSchema.index({ type: 1, createdAt: -1 });
 
 export function shapeStockMovement(doc) {
-  if (!doc) return null;
   const json = typeof doc.toJSON === "function" ? doc.toJSON() : { ...doc };
-  const id = (json.id || json._id)?.toString?.();
-  let medication = json.medication;
-  let unitPrice = 0;
-  if (medication && typeof medication === "object") {
-    unitPrice = Number(medication.unitPrice ?? 0);
-    medication = {
-      id: (medication.id || medication._id)?.toString?.(),
-      name: medication.name || "",
-      sku: medication.sku || "",
-      unit: medication.unit || "",
-      stock: medication.stock,
-      unitPrice,
-    };
-  } else if (medication) {
-    medication = { id: medication.toString(), name: "", sku: "", unit: "", unitPrice: 0 };
-  }
-  let performedBy = json.performedBy;
-  if (performedBy && typeof performedBy === "object") {
-    performedBy = {
-      id: (performedBy.id || performedBy._id)?.toString?.(),
-      name: performedBy.name,
-    };
-  } else if (performedBy) {
-    performedBy = { id: performedBy.toString() };
-  }
+  const med = json.medication && typeof json.medication === "object" ? json.medication : null;
+  const unitPrice = med ? Number(med.unitPrice) || 0 : 0;
+  const qty = Number(json.quantity) || 0;
   return {
-    id,
-    medication,
+    id: json.id,
+    medication: med
+      ? { id: (med.id || med._id)?.toString?.(), name: med.name || "", sku: med.sku || "", unit: med.unit || "pcs", unitPrice }
+      : { id: String(json.medication), name: "", sku: "", unit: "pcs", unitPrice: 0 },
     type: json.type,
-    quantity: json.quantity,
-    stockBefore: json.stockBefore,
-    stockAfter: json.stockAfter,
-    reason: json.reason,
+    quantity: qty,
+    stockBefore: Number(json.stockBefore) || 0,
+    stockAfter: Number(json.stockAfter) || 0,
+    reason: json.reason || "",
     note: json.note || "",
-    reference: json.reference || "",
-    performedBy,
+    totalCost: qty * unitPrice,
+    performedBy: json.performedBy?.name || null,
     createdAt: json.createdAt,
-    totalCost: Number(json.quantity || 0) * unitPrice,
+    updatedAt: json.updatedAt,
   };
 }
 

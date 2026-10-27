@@ -18,19 +18,9 @@ function endOfToday(date = new Date()) {
   return new Date(start.getTime() + 24 * 60 * 60 * 1000);
 }
 
-function emptyAddress() {
-  return { street: "", city: "", district: "", postalCode: "" };
-}
-
 function shapeDoctor(doc, extras = {}) {
   const json = typeof doc.toJSON === "function" ? doc.toJSON() : { ...doc };
-  return {
-    ...json,
-    address: json.address || emptyAddress(),
-    education: Array.isArray(json.education) ? json.education : [],
-    certifications: Array.isArray(json.certifications) ? json.certifications : [],
-    ...extras,
-  };
+  return { ...json, ...extras };
 }
 
 async function findDoctorOrThrow(id) {
@@ -43,17 +33,27 @@ export const getDoctorStats = asyncHandler(async (_req, res) => {
   const todayStart = startOfToday();
   const todayEnd = endOfToday();
 
-  const [total, patientsAssigned, appointmentsToday] = await Promise.all([
+  const [total, specialtyAgg, patientsAssigned, appointmentsToday] = await Promise.all([
     Doctor.countDocuments(),
+    Doctor.aggregate([
+      { $match: { specialty: { $nin: ["", null] } } },
+      { $group: { _id: "$specialty" } },
+      { $count: "count" },
+    ]),
     Patient.countDocuments({ doctor: { $ne: null } }),
     Appointment.countDocuments({
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
+      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
     }),
   ]);
-  const active = total;
+
   sendSuccess(res, {
-    data: { total, active, patientsAssigned, appointmentsToday },
+    data: {
+      total,
+      specialties: specialtyAgg[0]?.count || 0,
+      patientsAssigned,
+      appointmentsToday,
+    },
   });
 });
 
@@ -64,18 +64,12 @@ export const listDoctors = asyncHandler(async (req, res) => {
   if (specialty) filter.specialty = specialty;
   if (search) {
     const pattern = new RegExp(escapeRegex(search), "i");
-    filter.$or = [
-      { name: pattern },
-      { phone: pattern },
-      { email: pattern },
-      { specialty: pattern },
-      { title: pattern },
-    ];
+    filter.$or = [{ name: pattern }, { phone: pattern }, { email: pattern }, { specialty: pattern }, { title: pattern }];
   }
 
   const [doctors, total, specialtyValues] = await Promise.all([
     Doctor.find(filter)
-      .sort({ updatedAt: -1, _id: -1 })
+      .sort({ name: 1, _id: 1 })
       .skip((page - 1) * limit)
       .limit(limit),
     Doctor.countDocuments(filter),
@@ -104,19 +98,43 @@ export const getDoctor = asyncHandler(async (req, res) => {
   const todayStart = startOfToday();
   const todayEnd = endOfToday();
 
-  const [patientsAssigned, inTreatment, appointmentsToday, treatedCount] = await Promise.all([
-    Patient.countDocuments({ doctor: doctorId }),
+  const [patients, inTreatment, appointmentsToday, treatedCount] = await Promise.all([
+    Patient.find({ doctor: doctorId }).sort({ name: 1 }).lean(),
     Patient.countDocuments({ doctor: doctorId, status: PATIENT_STATUSES.IN_TREATMENT }),
     Appointment.countDocuments({
       doctor: doctorId,
       startsAt: { $gte: todayStart, $lt: todayEnd },
-      status: { $in: [APPOINTMENT_STATUSES.PENDING, APPOINTMENT_STATUSES.CONFIRMED] },
+      status: { $in: [APPOINTMENT_STATUSES.SCHEDULED, APPOINTMENT_STATUSES.IN_CHAIR] },
     }),
+    // Distinct patients who have completed at least one appointment with this doctor.
     Appointment.distinct("patient", {
       doctor: doctorId,
       status: APPOINTMENT_STATUSES.COMPLETED,
     }),
   ]);
+
+  const patientIds = patients.map((p) => p._id);
+  let lastVisitByPatient = {};
+  if (patientIds.length > 0) {
+    const visits = await Appointment.aggregate([
+      {
+        $match: {
+          patient: { $in: patientIds },
+          status: APPOINTMENT_STATUSES.COMPLETED,
+        },
+      },
+      { $sort: { startsAt: -1 } },
+      {
+        $group: {
+          _id: "$patient",
+          lastVisit: { $first: "$startsAt" },
+        },
+      },
+    ]);
+    lastVisitByPatient = Object.fromEntries(
+      visits.map((v) => [v._id.toString(), v.lastVisit]),
+    );
+  }
 
   sendSuccess(res, {
     data: {
@@ -125,72 +143,15 @@ export const getDoctor = asyncHandler(async (req, res) => {
         patientsTreated: treatedCount.length,
         inTreatment,
         appointmentsToday,
-        patientsAssigned,
+        patientsAssigned: patients.length,
       },
-    },
-  });
-});
-
-export const listDoctorPatients = asyncHandler(async (req, res) => {
-  const doctor = await findDoctorOrThrow(req.validated.params.id);
-  const doctorId = doctor._id;
-  const { search, page, limit } = req.validated.query;
-
-  const filter = { doctor: doctorId };
-  if (search) {
-    filter.name = new RegExp(escapeRegex(search), "i");
-  }
-
-  const [patients, total] = await Promise.all([
-    Patient.find(filter)
-      .select("name problem treatment status avatarUrl")
-      .sort({ updatedAt: -1, _id: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    Patient.countDocuments(filter),
-  ]);
-
-  const patientIds = patients.map((p) => p._id);
-  let completedByPatient = {};
-  if (patientIds.length > 0) {
-    const counts = await Appointment.aggregate([
-      {
-        $match: {
-          patient: { $in: patientIds },
-          doctor: doctorId,
-          status: APPOINTMENT_STATUSES.COMPLETED,
-        },
-      },
-      {
-        $group: {
-          _id: "$patient",
-          completedVisits: { $sum: 1 },
-        },
-      },
-    ]);
-    completedByPatient = Object.fromEntries(
-      counts.map((c) => [c._id.toString(), c.completedVisits]),
-    );
-  }
-
-  sendSuccess(res, {
-    data: {
       patients: patients.map((p) => ({
         id: p._id.toString(),
         name: p.name,
-        problem: p.problem || "",
-        treatment: p.treatment || "",
-        status: p.status,
         avatarUrl: p.avatarUrl || null,
-        completedVisits: completedByPatient[p._id.toString()] || 0,
+        status: p.status,
+        lastVisit: lastVisitByPatient[p._id.toString()] || null,
       })),
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-      },
     },
   });
 });
@@ -198,9 +159,6 @@ export const listDoctorPatients = asyncHandler(async (req, res) => {
 export const createDoctor = asyncHandler(async (req, res) => {
   const body = { ...req.validated.body };
   if (body.avatarUrl === "") body.avatarUrl = null;
-  if (!body.address) body.address = emptyAddress();
-  if (!body.education) body.education = [];
-  if (!body.certifications) body.certifications = [];
 
   const doctor = await Doctor.create(body);
 
